@@ -16,25 +16,8 @@ import bcrypt
 import jwt
 import aiofiles
 from bson import ObjectId
+from mangum import Mangum
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
-# Create uploads directory
-UPLOAD_DIR = ROOT_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-# MongoDB connection
-client = None
-db = None
-
-# JWT Configuration
-JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-this')
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
-
-# This is the new lifespan context manager
-# It replaces both the startup and shutdown event decorators.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, db
@@ -54,6 +37,30 @@ async def lifespan(app: FastAPI):
         print("Connected to MongoDB successfully!")
     except Exception as e:
         logging.error(f"Error connecting to MongoDB: {e}")
+
+
+app = FastAPI(title="MindMate - Student Mental Health Platform", lifespan=lifespan)
+api_router = APIRouter(prefix="/api")
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# Create uploads directory
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# MongoDB connection
+client = None
+db = None
+
+# JWT Configuration
+JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-this')
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
+
+# This is the new lifespan context manager
+# It replaces both the startup and shutdown event decorators.
+
         # You might want to raise an exception here to stop the app from starting.
         # For now, we'll just log it.
 
@@ -108,7 +115,7 @@ async def lifespan(app: FastAPI):
             await db.quizzes.insert_one(quiz)
             print(f"Inserted sample quiz: {quiz['title']}")
             
-    # The `yield` keyword is crucial. It hands control back to the application.
+    # The yield keyword is crucial. It hands control back to the application.
     yield
 
     # --- Code that runs on application shutdown ---
@@ -117,8 +124,6 @@ async def lifespan(app: FastAPI):
         client.close()
 
 # Create the main app instance and pass the lifespan function
-app = FastAPI(title="MindMate - Student Mental Health Platform", lifespan=lifespan)
-api_router = APIRouter(prefix="/api")
 
 # Security
 security = HTTPBearer()
@@ -197,7 +202,8 @@ class ResourceFile(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     title: str
     description: str
-    file_path: str
+    file_path: Optional[str] = None # Internal path, not for frontend
+    file_url: Optional[str] = None # Public URL for playback
     file_type: str  # video, audio
     uploaded_by: str
     category: str
@@ -328,10 +334,10 @@ async def get_user_sessions(current_user: User = Depends(get_current_user)):
 # Community Forum Routes
 @api_router.post("/groups", response_model=Group)
 async def create_group(name: str = Form(...), description: str = Form(...), 
-                      group_type: str = Form("support"), is_public: bool = Form(True),
-                      current_user: User = Depends(get_current_user)):
+                       group_type: str = Form("support"), is_public: bool = Form(True),
+                       current_user: User = Depends(get_current_user)):
     group = Group(name=name, description=description, group_type=group_type, 
-                 created_by=current_user.id, members=[current_user.id], is_public=is_public)
+                  created_by=current_user.id, members=[current_user.id], is_public=is_public)
     await db.groups.insert_one(group.dict())
     return group
 
@@ -358,9 +364,9 @@ async def get_group_messages(group_id: str, current_user: User = Depends(get_cur
 
 @api_router.post("/messages", response_model=Message)
 async def send_message(content: str = Form(...), receiver_id: str = Form(None), 
-                      group_id: str = Form(None), current_user: User = Depends(get_current_user)):
+                       group_id: str = Form(None), current_user: User = Depends(get_current_user)):
     message = Message(sender_id=current_user.id, receiver_id=receiver_id, 
-                     group_id=group_id, content=content)
+                      group_id=group_id, content=content)
     await db.messages.insert_one(message.dict())
     return message
 
@@ -418,9 +424,11 @@ async def upload_resource(
         file_path=str(file_path),
         file_type="video" if file.content_type.startswith("video") else "audio",
         uploaded_by=current_user.id,
-        category=category
+        category=category,
+        # IMPORTANT: The file_url is not saved to the DB here. It's generated on retrieval.
+        file_url=None
     )
-    await db.resources.insert_one(resource.dict())
+    await db.resources.insert_one(resource.dict(exclude_none=True))
     
     return resource
 
@@ -430,8 +438,22 @@ async def get_resources(category: str = None):
     if category:
         query["category"] = category
     
-    resources = await db.resources.find(query).sort("created_at", -1).to_list(50)
-    return [ResourceFile(**resource) for resource in resources]
+    resources_cursor = db.resources.find(query).sort("created_at", -1)
+    
+    response_resources = []
+    async for resource in resources_cursor:
+        # Generate the public URL from the stored file_path
+        file_url = f"/uploads/{Path(resource['file_path']).name}"
+        
+        # Create a new dictionary to add the file_url
+        resource_data = {
+            **resource,
+            "file_url": file_url
+        }
+        
+        response_resources.append(ResourceFile(**resource_data))
+        
+    return response_resources
 
 # Quiz Routes
 @api_router.get("/quizzes", response_model=List[Quiz])
@@ -442,7 +464,7 @@ async def get_quizzes():
 # Mood Tracking
 @api_router.post("/mood", response_model=MoodEntry)
 async def record_mood(mood: str = Form(...), emoji: str = Form(...), 
-                     current_user: User = Depends(get_current_user)):
+                       current_user: User = Depends(get_current_user)):
     mood_entry = MoodEntry(user_id=current_user.id, mood=mood, emoji=emoji)
     await db.mood_entries.insert_one(mood_entry.dict())
     return mood_entry
@@ -474,9 +496,5 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-from mangum import Mangum
 
-app = FastAPI()
-# … your routes …
-
-handler = Mangum(app)
+handler = Mangum(app) check this
